@@ -1,11 +1,3 @@
-// Hush example: CRUD notes.
-//
-// In-memory notes store with Create, List, Get, Update, Delete operations.
-//
-// Usage:
-//   Terminal 1: cargo run --example crud server
-//   Terminal 2: cargo run --example crud client <key_id> <key_secret_hex> <hush_port>
-
 use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +41,8 @@ fn main() {
 }
 
 fn run_server() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
     let api_key = ApiKey::generate();
 
     let mut keys = HashMap::new();
@@ -72,10 +66,8 @@ fn run_server() {
                 return Ok(Response { status: StatusCode::BadRequest, payload: Some(m), seq: 0 });
             }
         };
-
         let id = nid_c.fetch_add(1, Ordering::SeqCst);
         notes_c.lock().unwrap().insert(id, text);
-
         let mut m = tlv::Map::new();
         m.set("id", tlv::Value::Uint64(id));
         Ok(Response { status: StatusCode::Success, payload: Some(m), seq: 0 })
@@ -85,7 +77,6 @@ fn run_server() {
     let notes_l = notes.clone();
     srv.handle(0x0002, move |_| {
         let snapshot = notes_l.lock().unwrap().clone();
-
         let mut items = Vec::new();
         for (id, text) in &snapshot {
             let mut m = tlv::Map::new();
@@ -93,7 +84,6 @@ fn run_server() {
             m.set("text", tlv::Value::String(text.clone()));
             items.push(tlv::Value::Map(m));
         }
-
         let mut m = tlv::Map::new();
         m.set("notes", tlv::Value::Array(items));
         m.set("count", tlv::Value::Uint64(snapshot.len() as u64));
@@ -111,7 +101,6 @@ fn run_server() {
                 return Ok(Response { status: StatusCode::BadRequest, payload: Some(m), seq: 0 });
             }
         };
-
         let snapshot = notes_g.lock().unwrap().clone();
         match snapshot.get(&id) {
             Some(text) => {
@@ -147,10 +136,9 @@ fn run_server() {
                 return Ok(Response { status: StatusCode::BadRequest, payload: Some(m), seq: 0 });
             }
         };
-
-        let mut notes = notes_u.lock().unwrap();
-        if notes.contains_key(&id) {
-            notes.insert(id, text);
+        let mut n = notes_u.lock().unwrap();
+        if n.contains_key(&id) {
+            n.insert(id, text);
             let mut m = tlv::Map::new();
             m.set("id", tlv::Value::Uint64(id));
             m.set("updated", tlv::Value::Bool(true));
@@ -173,7 +161,6 @@ fn run_server() {
                 return Ok(Response { status: StatusCode::BadRequest, payload: Some(m), seq: 0 });
             }
         };
-
         let existed = notes_d.lock().unwrap().remove(&id).is_some();
         let mut m = tlv::Map::new();
         m.set("deleted", tlv::Value::Bool(existed));
@@ -196,7 +183,6 @@ fn run_server() {
     println!("  0x0005  Delete(id)       → ok");
     println!();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(srv.listen_on(endpoint)).unwrap();
 }
 
@@ -210,7 +196,6 @@ async fn run_client(key_id: &str, key_secret_hex: &str, port: &str) {
 
     println!("Session: {}\n", client.session_id());
 
-    // Create some notes
     let titles = vec!["buy milk", "call mom", "fix the bug"];
     let mut ids = Vec::new();
     for title in &titles {
@@ -222,7 +207,6 @@ async fn run_client(key_id: &str, key_secret_hex: &str, port: &str) {
         println!("✅ Created note {}: {}", id, title);
     }
 
-    // List
     let resp = client.do_(0x0002, None).await.expect("list");
     let count = resp.payload.as_ref().and_then(|p| p.get_uint64("count")).unwrap_or(0);
     println!("\n📋 {} notes total", count);
@@ -238,27 +222,23 @@ async fn run_client(key_id: &str, key_secret_hex: &str, port: &str) {
         }
     }
 
-    // Update
     let mut m = tlv::Map::new();
     m.set("id", tlv::Value::Uint64(ids[0]));
     m.set("text", tlv::Value::String("buy milk and eggs".into()));
     client.do_(0x0004, Some(m)).await.expect("update");
     println!("\n✏️  Updated note {}", ids[0]);
 
-    // Get
     let mut m = tlv::Map::new();
     m.set("id", tlv::Value::Uint64(ids[0]));
     let resp = client.do_(0x0003, Some(m)).await.expect("get");
     let text = resp.payload.as_ref().and_then(|p| p.get_string("text")).unwrap_or("?");
     println!("🔍  Note {}: {}", ids[0], text);
 
-    // Delete
     let mut m = tlv::Map::new();
     m.set("id", tlv::Value::Uint64(ids[2]));
     client.do_(0x0005, Some(m)).await.expect("delete");
     println!("🗑️  Deleted note {}", ids[2]);
 
-    // List again
     let resp = client.do_(0x0002, None).await.expect("list");
     let count = resp.payload.as_ref().and_then(|p| p.get_uint64("count")).unwrap_or(0);
     println!("\n📋 {} notes remaining", count);

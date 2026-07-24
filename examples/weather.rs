@@ -1,11 +1,3 @@
-// Hush example: Weather API.
-//
-// Server proxies wttr.in through Hush. Client queries weather by city name.
-//
-// Usage:
-//   Terminal 1: cargo run --example weather server
-//   Terminal 2: cargo run --example weather client <key_id> <key_secret_hex> <hush_port> <city>
-
 use std::env;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -48,6 +40,8 @@ fn main() {
 }
 
 fn run_server() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
     let api_key = ApiKey::generate();
 
     let mut keys = HashMap::new();
@@ -98,7 +92,6 @@ fn run_server() {
     println!("Try:          cargo run --example weather client {} {} {} London", api_key.id, hex::encode(&api_key.secret), port);
     println!();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(srv.listen_on(endpoint)).unwrap();
 }
 

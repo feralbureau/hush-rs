@@ -41,14 +41,15 @@ pub async fn dial(
         )
     );
 
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+    let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
         .map_err(|e| TransportError::Config(format!("bind: {}", e)))?;
 
     let addr: std::net::SocketAddr = addr.parse()
         .map_err(|e| TransportError::Config(format!("addr parse: {}", e)))?;
 
+    let server_name = addr.ip().to_string();
     let conn = endpoint
-        .connect_with(quic_config, addr, DEFAULT_ALPN)
+        .connect_with(quic_config, addr, &server_name)
         .map_err(|e| TransportError::Config(format!("connect: {}", e)))?
         .await
         .map_err(|e| TransportError::Config(format!("handshake: {}", e)))?;

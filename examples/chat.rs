@@ -1,12 +1,3 @@
-// Hush example: Real-time chat.
-//
-// Uses a broadcast channel for multi-client messaging.
-// Clients send messages which are broadcast to all subscribers.
-//
-// Usage:
-//   Terminal 1: cargo run --example chat server
-//   Terminal 2: cargo run --example chat client <key_id> <key_secret_hex> <hush_port> <nick>
-
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -50,6 +41,8 @@ fn main() {
 }
 
 fn run_server() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
     let api_key = ApiKey::generate();
 
     let mut keys = HashMap::new();
@@ -58,10 +51,8 @@ fn run_server() {
 
     let srv = Server::new(store);
 
-    // Broadcast channel for chat messages (capacity 256)
     let (tx, _) = tokio::sync::broadcast::channel::<(String, String)>(256);
 
-    // 0x0001 — Send message
     let tx_c = tx.clone();
     srv.handle(0x0001, move |payload| {
         let nick = match payload.get_string("nick") {
@@ -99,7 +90,6 @@ fn run_server() {
     println!("Join:         cargo run --example chat client {} {} {} <nick>", api_key.id, hex::encode(&api_key.secret), port);
     println!();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(srv.listen_on(endpoint)).unwrap();
 }
 
