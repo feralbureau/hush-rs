@@ -7,3 +7,4 @@ pub mod server;
 pub mod media;
 pub mod hub;
 pub mod logger;
+pub mod middleware;

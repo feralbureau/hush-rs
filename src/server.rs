@@ -66,10 +66,10 @@ impl FrameStream {
 // ── Handler dispatch types ─────────────────────────────────
 
 /// Mirrors `hush-go/server.HandlerFunc` — receives a Request and returns a Response.
-type SyncHandler = Arc<dyn Fn(Request) -> Result<Response, String> + Send + Sync>;
+pub type SyncHandler = Arc<dyn Fn(Request) -> Result<Response, String> + Send + Sync>;
 
 /// Mirrors `hush-go/server.StreamHandlerFunc` — receives Request + stream + key.
-type StreamHandler = Arc<dyn Fn(Request, FrameStream, Vec<u8>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub type StreamHandler = Arc<dyn Fn(Request, FrameStream, Vec<u8>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 enum HandlerType {
     Sync(SyncHandler),
@@ -90,6 +90,8 @@ pub struct Server {
     media_store: Option<Arc<Mutex<TokenStore>>>,
     logger: Option<Arc<Logger>>,
     session_cfg: SessionConfig,
+    middlewares: Vec<crate::middleware::Middleware>,
+    stream_middlewares: Vec<crate::middleware::StreamMiddleware>,
 }
 
 impl Server {
@@ -110,6 +112,8 @@ impl Server {
             media_store: None,
             logger: None,
             session_cfg: cfg,
+            middlewares: Vec::new(),
+            stream_middlewares: Vec::new(),
         }
     }
 
@@ -138,32 +142,51 @@ impl Server {
         self
     }
 
+    // ── Middleware ──────────────────────────────────────────
+
+    /// Add a Middleware that wraps every subsequently registered handler.
+    pub fn use_middleware(&mut self, mw: crate::middleware::Middleware) {
+        self.middlewares.push(mw);
+    }
+
+    /// Add a StreamMiddleware that wraps every subsequently registered streaming handler.
+    pub fn use_stream_middleware(&mut self, mw: crate::middleware::StreamMiddleware) {
+        self.stream_middlewares.push(mw);
+    }
+
     // ── Handler registration ───────────────────────────────
 
     /// Register a request-response handler.
     /// Mirrors [`hush-go/server.HandleFunc`](https://github.com/feralbureau/hush-go/blob/main/server/server.go).
-    pub fn handle<F>(&self, opcode: u16, handler: F)
+    pub fn handle<F>(&mut self, opcode: u16, handler: F)
     where
         F: Fn(Request) -> Result<Response, String> + Send + Sync + 'static,
     {
+        let mut h: SyncHandler = Arc::new(handler);
+        for mw in self.middlewares.iter().rev() {
+            h = mw(h);
+        }
         self.handlers
             .lock()
             .unwrap()
-            .insert(opcode, HandlerType::Sync(Arc::new(handler)));
+            .insert(opcode, HandlerType::Sync(h));
     }
 
     /// Register a streaming handler.
     /// Mirrors [`hush-go/server.HandleStreamFunc`](https://github.com/feralbureau/hush-go/blob/main/server/server.go).
-    pub fn handle_stream<F, Fut>(&self, opcode: u16, handler: F)
+    pub fn handle_stream<F, Fut>(&mut self, opcode: u16, handler: F)
     where
         F: Fn(Request, FrameStream, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let wrapped: StreamHandler = Arc::new(move |req, stream, key| Box::pin(handler(req, stream, key)));
+        let mut h: StreamHandler = Arc::new(move |req, stream, key| Box::pin(handler(req, stream, key)));
+        for mw in self.stream_middlewares.iter().rev() {
+            h = mw(h);
+        }
         self.handlers
             .lock()
             .unwrap()
-            .insert(opcode, HandlerType::Stream(wrapped));
+            .insert(opcode, HandlerType::Stream(h));
     }
 
     // ── TLS helper ─────────────────────────────────────────

@@ -55,7 +55,7 @@ fn run_server() {
     keys.insert(api_key.id.clone(), api_key.secret.clone());
     let store = KeyStore(Arc::new(Mutex::new(keys)));
 
-    let srv = Server::new(store);
+    let mut srv = Server::new(store);
 
     srv.handle(0x0001, |req: Request| {
         let city = match req.payload.get_string("city") {

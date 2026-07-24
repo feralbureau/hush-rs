@@ -57,7 +57,7 @@ fn run_server() {
     keys.insert(api_key.id.clone(), api_key.secret.clone());
     let store = KeyStore(Arc::new(Mutex::new(keys)));
 
-    let srv = Server::new(store);
+    let mut srv = Server::new(store);
 
     let hub = Arc::new(Hub::new());
 
