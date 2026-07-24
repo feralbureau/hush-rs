@@ -1,13 +1,13 @@
 # hush-rs 🔇
 
-**Stealth-first API protocol for Rust.**
+**Stealth-first API protocol for Rust — QUIC and TCP.**
 
 Hush is a network protocol framework that makes your API invisible to standard
 tooling. No HTTP endpoints to discover, no readable request structure, no replay
-attacks. It runs over QUIC with a custom ALPN, encodes payloads in a compact
-binary TLV format, and encrypts every frame with per-session AES-256-GCM keys.
-
-```toml
+tooling. No HTTP endpoints to discover, no readable request structure, no replay
+attacks. Supports both **QUIC** (UDP, fast) and **TLS-over-TCP** (compatible with
+Cloudflare and standard load balancers), encodes payloads in a compact binary
+TLV format, and encrypts every frame with per-session AES-256-GCM keys.
 [dependencies]
 hush = { git = "https://github.com/feralbureau/hush-rs" }
 ```
@@ -150,7 +150,7 @@ src/
 └── media.rs       Session-bound media tokens for HTTP media delivery
 ```
 
-### `transport` — QUIC connectivity
+### `transport` — QUIC and TCP connectivity
 
 ```rust
 use hush::transport;
@@ -293,6 +293,25 @@ let count = payload.get_uint64("count").unwrap();      // 42
 let nested = payload.get_map("nested").unwrap();
 ```
 
+### `session` — Anonymous handshake
+
+The handshake supports **anonymous sessions** by sending `key_len=0`.
+The session key is derived from X25519 ECDH alone (no API secret).
+
+```rust,ignore
+// Client: empty ID = anonymous
+let client = Client::dial("127.0.0.1:443", &ApiKey::default(), None).await?;
+// Or over TCP:
+let client = Client::dial_tcp("api:8443", &ApiKey::default(), None).await?;
+```
+
+```rust,ignore
+// Server: accepts both anonymous and authenticated
+srv.handle(0x0001, |req: Request| {
+    Ok(new_response(tlv::Map::new()))
+});
+```
+
 ### `client` — High-level client
 
 ```rust
@@ -337,6 +356,20 @@ rt.block_on(srv.listen_on(endpoint)).unwrap();
 | `srv.handle(opcode, fn)` | Register a request handler |
 | `Server::load_tls(cert, key)` | Load TLS certificate files |
 | `srv.listen_on(endpoint)` | Accept connections on a QUIC endpoint |
+
+### `server` — Middleware
+
+```rust,ignore
+srv.use_middleware(hush::middleware::logging_middleware(Some(logger)));
+srv.use_middleware(hush::middleware::recovery_middleware());
+srv.use_middleware(hush::middleware::require_api_key_id(vec!["admin".into()]));
+```
+
+Built-in middleware:
+- `logging_middleware` — logs opcode, status, duration
+- `recovery_middleware` — catches panics in handlers
+- `require_api_key_id` — restrict to specific API keys
+- `rate_limit_middleware` — sliding-window rate limiter
 
 ### `media` — Media token management
 
