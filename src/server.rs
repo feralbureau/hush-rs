@@ -1,10 +1,12 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::frame::{self, Response, StatusCode};
-use crate::session::{self, ApiKeyStore, Session, SessionStore};
+use crate::session::{self, ApiKeyStore, Session};
 use crate::tlv;
+use crate::transport;
 
 #[derive(Error, Debug)]
 pub enum ServerError {
@@ -30,27 +32,40 @@ impl From<quinn::ReadExactError> for ServerError {
     }
 }
 
+type SyncHandler = Arc<dyn Send + Sync + Fn(tlv::Map) -> Result<Response, String>>;
+
+enum Handler {
+    Sync(SyncHandler),
+}
 
 pub struct Server {
-    _sessions: Arc<SessionStore>,
+    handlers: Arc<Mutex<HashMap<u16, Handler>>>,
     key_store: Arc<dyn ApiKeyStore>,
-    server_public: x25519_dalek::PublicKey,
 }
 
 impl Server {
     pub fn new(key_store: impl ApiKeyStore + 'static) -> Self {
-        let (_secret, public) = session::generate_key_pair();
         Server {
-            _sessions: Arc::new(SessionStore::default()),
+            handlers: Arc::new(Mutex::new(HashMap::new())),
             key_store: Arc::new(key_store),
-            server_public: public,
         }
     }
 
-    pub async fn listen(&self, addr: &str) -> Result<(), ServerError> {
-        let cert_pem = std::fs::read("test-cert.pem")
+    pub fn handle<F>(&self, opcode: u16, handler: F)
+    where
+        F: Fn(tlv::Map) -> Result<Response, String> + Send + Sync + 'static,
+    {
+        self.handlers
+            .lock()
+            .unwrap()
+            .insert(opcode, Handler::Sync(Arc::new(handler)));
+    }
+
+    /// Load TLS config from cert and key PEM files.
+    pub fn load_tls(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig, ServerError> {
+        let cert_pem = std::fs::read(cert_path)
             .map_err(|e| ServerError::Config(format!("read cert: {}", e)))?;
-        let key_pem = std::fs::read("test-key.pem")
+        let key_pem = std::fs::read(key_path)
             .map_err(|e| ServerError::Config(format!("read key: {}", e)))?;
 
         let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
@@ -61,15 +76,19 @@ impl Server {
             .map_err(|e| ServerError::Config(format!("parse key: {}", e)))?
             .ok_or_else(|| ServerError::Config("no private key".into()))?;
 
-        let tls_config = rustls::ServerConfig::builder()
+        rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(|e| ServerError::Config(format!("tls: {}", e)))?;
+            .map_err(|e| ServerError::Config(format!("tls: {}", e)))
+    }
 
-        let endpoint = crate::transport::listen(addr, tls_config)
-            .map_err(|e| ServerError::Config(format!("listen: {}", e)))?;
+    /// Accept connections on a pre-bound QUIC endpoint.
+    pub async fn listen_on(&self, endpoint: quinn::Endpoint) -> Result<(), ServerError> {
+        let addr = endpoint.local_addr().map_err(|e| ServerError::Config(format!("local addr: {}", e)))?;
+        log::info!("hush: listening on {} (ALPN: {})", addr, transport::DEFAULT_ALPN);
 
-        log::info!("hush: listening on {} (ALPN: {})", addr, crate::transport::DEFAULT_ALPN);
+        let handlers = self.handlers.clone();
+        let key_store = self.key_store.clone();
 
         loop {
             let conn = match endpoint.accept().await {
@@ -77,11 +96,11 @@ impl Server {
                 None => return Err(ServerError::Config("endpoint closed".into())),
             };
 
-            let key_store = self.key_store.clone();
-            let server_pub = self.server_public;
+            let handlers = handlers.clone();
+            let key_store = key_store.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(conn, key_store, server_pub).await {
+                if let Err(e) = handle_connection(conn, handlers, key_store).await {
                     log::error!("{}", e);
                 }
             });
@@ -91,12 +110,12 @@ impl Server {
 
 async fn handle_connection(
     conn: quinn::Connection,
+    handlers: Arc<Mutex<HashMap<u16, Handler>>>,
     key_store: Arc<dyn ApiKeyStore>,
-    server_pub: x25519_dalek::PublicKey,
 ) -> Result<(), ServerError> {
     let (mut send, mut recv) = conn.accept_bi().await?;
 
-    let (secret, _) = session::generate_key_pair();
+    let (server_priv, server_pub_key) = session::generate_key_pair();
 
     let mut header = [0u8; 2];
     recv.read_exact(&mut header).await?;
@@ -109,21 +128,23 @@ async fn handle_connection(
     recv.read_exact(&mut key_buf).await?;
 
     let api_key_id = String::from_utf8_lossy(&key_buf[..key_len]).to_string();
-    let client_pub_bytes: [u8; 32] = key_buf[key_len..].try_into()
+    let client_pub_bytes: [u8; 32] = key_buf[key_len..]
+        .try_into()
         .map_err(|_| ServerError::Config("invalid client pubkey".into()))?;
     let client_pub = x25519_dalek::PublicKey::from(client_pub_bytes);
 
-    let api_key_secret = key_store.get(&api_key_id)
+    let api_key_secret = key_store
+        .get(&api_key_id)
         .ok_or_else(|| ServerError::Config(format!("unknown key: {}", api_key_id)))?;
 
-    let server_pub_bytes = server_pub.to_bytes();
+    let spub_bytes = server_pub_key.to_bytes();
     let session_id: u64 = 1;
 
-    let shared = session::shared_secret(secret, &client_pub);
+    let shared = session::shared_secret(server_priv, &client_pub);
     let session_key = session::derive_session_key(shared.as_bytes(), &api_key_secret)?;
 
     let mut resp = Vec::with_capacity(40);
-    resp.extend_from_slice(&server_pub_bytes);
+    resp.extend_from_slice(&spub_bytes);
     resp.extend_from_slice(&session_id.to_be_bytes());
     send.write_all(&resp).await?;
 
@@ -136,17 +157,20 @@ async fn handle_connection(
             Err(_) => break Ok(()),
         };
 
+        let handlers = handlers.clone();
         let sess = sess.clone();
+
         tokio::spawn(async move {
-            handle_request(&mut req_recv, &mut req_send, &sess).await;
+            handle_stream(&mut req_recv, &mut req_send, &sess, &handlers).await;
         });
     }
 }
 
-async fn handle_request(
+async fn handle_stream(
     recv: &mut (impl AsyncReadExt + Unpin),
     send: &mut (impl AsyncWriteExt + Unpin),
     sess: &Session,
+    handlers: &Mutex<HashMap<u16, Handler>>,
 ) {
     let mut len_buf = [0u8; 4];
     if recv.read_exact(&mut len_buf).await.is_err() {
@@ -162,20 +186,39 @@ async fn handle_request(
         return;
     }
 
-    // payload = [4-byte seq][encrypted body]
     let (req, seq) = match frame::decode_request(Some(&sess.key), &payload) {
         Ok(r) => r,
         Err(_) => return,
     };
 
-    let response = Response {
-        status: StatusCode::NotFound,
-        payload: Some({
-            let mut m = tlv::Map::new();
-            m.set("opcode", tlv::Value::Uint16(req.opcode));
-            m
-        }),
-        seq,
+    let response = {
+        let guarded = handlers.lock().unwrap();
+        match guarded.get(&req.opcode) {
+            Some(Handler::Sync(f)) => {
+                let payload = req.payload.unwrap_or_else(tlv::Map::new);
+                match f(payload) {
+                    Ok(r) => r,
+                    Err(e) => Response {
+                        status: StatusCode::InternalError,
+                        payload: Some({
+                            let mut m = tlv::Map::new();
+                            m.set("error", tlv::Value::String(e));
+                            m
+                        }),
+                        seq,
+                    },
+                }
+            }
+            None => Response {
+                status: StatusCode::NotFound,
+                payload: Some({
+                    let mut m = tlv::Map::new();
+                    m.set("opcode", tlv::Value::Uint16(req.opcode));
+                    m
+                }),
+                seq,
+            },
+        }
     };
 
     if let Ok(resp_body) = frame::encode_response_body(Some(&sess.key), &response) {

@@ -1,5 +1,3 @@
-//! QUIC transport helpers.
-
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -8,9 +6,25 @@ pub const DEFAULT_ALPN: &str = "hush/1";
 #[derive(Error, Debug)]
 pub enum TransportError {
     #[error("transport: {0}")]
-    Connection(#[from] quinn::ConnectionError),
-    #[error("transport: {0}")]
     Config(String),
+}
+
+/// Bind to addr and return the endpoint.
+pub fn bind(addr: &str, server_tls: rustls::ServerConfig) -> Result<quinn::Endpoint, TransportError> {
+    let quic_config = quinn::ServerConfig::with_crypto(
+        Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_tls)
+                .map_err(|e| TransportError::Config(format!("quic config: {}", e)))?
+        )
+    );
+
+    let endpoint = quinn::Endpoint::server(
+        quinn::ServerConfig::clone(&quic_config),
+        addr.parse()
+            .map_err(|e| TransportError::Config(format!("addr parse: {}", e)))?,
+    ).map_err(|e| TransportError::Config(format!("bind: {}", e)))?;
+
+    Ok(endpoint)
 }
 
 /// Dial a QUIC connection to addr.
@@ -27,7 +41,7 @@ pub async fn dial(
         )
     );
 
-    let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
         .map_err(|e| TransportError::Config(format!("bind: {}", e)))?;
 
     let addr: std::net::SocketAddr = addr.parse()
@@ -36,35 +50,13 @@ pub async fn dial(
     let conn = endpoint
         .connect_with(quic_config, addr, DEFAULT_ALPN)
         .map_err(|e| TransportError::Config(format!("connect: {}", e)))?
-        .await?;
+        .await
+        .map_err(|e| TransportError::Config(format!("handshake: {}", e)))?;
 
     Ok((conn, endpoint))
 }
 
-/// Create a QUIC server endpoint that listens on addr.
-pub fn listen(
-    addr: &str,
-    server_tls: rustls::ServerConfig,
-) -> Result<quinn::Endpoint, TransportError> {
-    let quic_config = quinn::ServerConfig::with_crypto(
-        Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(server_tls)
-                .map_err(|e| TransportError::Config(format!("quic config: {}", e)))?
-        )
-    );
-
-    let endpoint = quinn::Endpoint::server(
-        quinn::ServerConfig::clone(&quic_config),
-        addr.parse()
-            .map_err(|e| TransportError::Config(format!("addr parse: {}", e)))?,
-    ).map_err(|e| TransportError::Config(format!("listen: {}", e)))?;
-
-    Ok(endpoint)
-}
-
 pub fn insecure_client_tls() -> rustls::ClientConfig {
-    
-
     rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(
