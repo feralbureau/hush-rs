@@ -1,10 +1,17 @@
-use std::env;
+// Hush example: Weather API.
+//
+// Proxies wttr.in (no auth required) through Hush.
+//
+// Usage:
+//   Terminal 1: cargo run --example weather server
+//   Terminal 2: cargo run --example weather client <key_id> <secret> <port> <city>
 use std::collections::HashMap;
+use std::env;
 use std::sync::{Arc, Mutex};
 
 use hush::frame::{Response, StatusCode};
+use hush::server::{Request, Server};
 use hush::session::{ApiKey, ApiKeyStore};
-use hush::server::Server;
 use hush::tlv;
 use hush::transport;
 
@@ -50,8 +57,8 @@ fn run_server() {
 
     let srv = Server::new(store);
 
-    srv.handle(0x0001, |payload| {
-        let city = match payload.get_string("city") {
+    srv.handle(0x0001, |req: Request| {
+        let city = match req.payload.get_string("city") {
             Some(c) => c.to_string(),
             None => {
                 let mut m = tlv::Map::new();

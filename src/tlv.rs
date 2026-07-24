@@ -140,7 +140,13 @@ impl Map {
         self.entries.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    
+/// Wrap a Map into a Value for use in nested containers.
+pub fn map_value(m: &Map) -> Value {
+    Value::Map(m.clone())
+}
+
+pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }

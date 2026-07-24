@@ -28,7 +28,7 @@ pub enum SessionError {
     Crypto(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ApiKey {
     pub id: String,
     pub secret: Vec<u8>,
@@ -44,7 +44,7 @@ impl ApiKey {
     }
 }
 
-use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
+use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret, StaticSecret};
 
 /// Generate X25519 key pair.
 pub fn generate_key_pair() -> (EphemeralSecret, PublicKey) {
@@ -124,7 +124,7 @@ impl Session {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SessionConfig {
     pub idle_timeout: Duration,
     pub max_lifetime: Duration,
@@ -367,5 +367,41 @@ mod tests {
         let server_key = derive_session_key(server_shared.as_bytes(), &key.secret).unwrap();
 
         assert_eq!(client_key, server_key);
+    }
+}
+
+// ── Static key support (for servers) ──────────────────────
+
+
+/// Generate a static X25519 key pair for long-lived server use.
+pub fn generate_static_key() -> StaticSecret {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    StaticSecret::from(bytes)
+}
+
+/// Compute ECDH shared secret from a static private key.
+pub fn shared_secret_static(priv_key: &StaticSecret, pub_key: &PublicKey) -> SharedSecret {
+    priv_key.diffie_hellman(pub_key)
+}
+
+impl SessionConfig {
+    /// Return a config with zero values replaced by defaults.
+    pub fn fill(self) -> Self {
+        SessionConfig {
+            idle_timeout: if self.idle_timeout <= Duration::ZERO { DEFAULT_IDLE_TIMEOUT } else { self.idle_timeout },
+            max_lifetime: if self.max_lifetime <= Duration::ZERO { DEFAULT_MAX_LIFETIME } else { self.max_lifetime },
+            gc_interval: if self.gc_interval <= Duration::ZERO { DEFAULT_GC_INTERVAL } else { self.gc_interval },
+        }
+    }
+}
+
+impl Clone for SessionConfig {
+    fn clone(&self) -> Self {
+        SessionConfig {
+            idle_timeout: self.idle_timeout,
+            max_lifetime: self.max_lifetime,
+            gc_interval: self.gc_interval,
+        }
     }
 }

@@ -1,11 +1,18 @@
+// Hush example: CRUD notes.
+//
+// In-memory notes with Create, List, Get, Update, Delete.
+//
+// Usage:
+//   Terminal 1: cargo run --example crud server
+//   Terminal 2: cargo run --example crud client <id> <secret> <port>
 use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hush::frame::{Response, StatusCode};
+use hush::server::{Request, Server};
 use hush::session::{ApiKey, ApiKeyStore};
-use hush::server::Server;
 use hush::tlv;
 use hush::transport;
 
@@ -57,8 +64,8 @@ fn run_server() {
     // 0x0001 — Create
     let notes_c = notes.clone();
     let nid_c = next_id.clone();
-    srv.handle(0x0001, move |payload| {
-        let text = match payload.get_string("text") {
+    srv.handle(0x0001, move |req: Request| {
+        let text = match req.payload.get_string("text") {
             Some(t) => t.to_string(),
             None => {
                 let mut m = tlv::Map::new();
@@ -75,7 +82,7 @@ fn run_server() {
 
     // 0x0002 — List
     let notes_l = notes.clone();
-    srv.handle(0x0002, move |_| {
+    srv.handle(0x0002, move |_req: Request| {
         let snapshot = notes_l.lock().unwrap().clone();
         let mut items = Vec::new();
         for (id, text) in &snapshot {
@@ -92,8 +99,8 @@ fn run_server() {
 
     // 0x0003 — Get
     let notes_g = notes.clone();
-    srv.handle(0x0003, move |payload| {
-        let id = match payload.get_uint64("id") {
+    srv.handle(0x0003, move |req: Request| {
+        let id = match req.payload.get_uint64("id") {
             Some(id) if id != 0 => id,
             _ => {
                 let mut m = tlv::Map::new();
@@ -119,8 +126,8 @@ fn run_server() {
 
     // 0x0004 — Update
     let notes_u = notes.clone();
-    srv.handle(0x0004, move |payload| {
-        let id = match payload.get_uint64("id") {
+    srv.handle(0x0004, move |req: Request| {
+        let id = match req.payload.get_uint64("id") {
             Some(id) if id != 0 => id,
             _ => {
                 let mut m = tlv::Map::new();
@@ -128,7 +135,7 @@ fn run_server() {
                 return Ok(Response { status: StatusCode::BadRequest, payload: Some(m), seq: 0 });
             }
         };
-        let text = match payload.get_string("text") {
+        let text = match req.payload.get_string("text") {
             Some(t) => t.to_string(),
             None => {
                 let mut m = tlv::Map::new();
@@ -152,8 +159,8 @@ fn run_server() {
 
     // 0x0005 — Delete
     let notes_d = notes.clone();
-    srv.handle(0x0005, move |payload| {
-        let id = match payload.get_uint64("id") {
+    srv.handle(0x0005, move |req: Request| {
+        let id = match req.payload.get_uint64("id") {
             Some(id) if id != 0 => id,
             _ => {
                 let mut m = tlv::Map::new();

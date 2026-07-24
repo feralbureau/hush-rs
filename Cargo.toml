@@ -18,7 +18,7 @@ webpki-roots = "0.26"
 rustls-pki-types = "1"
 
 # Crypto
-x25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets", "reusable_secrets"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"

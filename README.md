@@ -1,4 +1,4 @@
-# hush-rs 🔇
+# hush-rs
 
 **Stealth-first API protocol for Rust.**
 

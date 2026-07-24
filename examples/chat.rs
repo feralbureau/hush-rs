@@ -1,11 +1,19 @@
+// Hush example: Real-time chat.
+//
+// Uses Hush's hub for a multi-client chat room.
+//
+// Usage:
+//   Terminal 1: cargo run --example chat server
+//   Terminal 2: cargo run --example chat client <key_id> <secret> <port> <nick>
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::sync::{Arc, Mutex};
 
 use hush::frame::{Response, StatusCode};
+use hush::hub::Hub;
+use hush::server::{FrameStream, Request, Server};
 use hush::session::{ApiKey, ApiKeyStore};
-use hush::server::Server;
 use hush::tlv;
 use hush::transport;
 
@@ -51,11 +59,12 @@ fn run_server() {
 
     let srv = Server::new(store);
 
-    let (tx, _) = tokio::sync::broadcast::channel::<(String, String)>(256);
+    let hub = Arc::new(Hub::new());
 
-    let tx_c = tx.clone();
-    srv.handle(0x0001, move |payload| {
-        let nick = match payload.get_string("nick") {
+    // 0x0001 — Send message (request-response)
+    let hub_pub = hub.clone();
+    srv.handle(0x0001, move |req: Request| {
+        let nick = match req.payload.get_string("nick") {
             Some(n) => n.to_string(),
             None => {
                 let mut m = tlv::Map::new();
@@ -63,7 +72,7 @@ fn run_server() {
                 return Ok(Response { status: StatusCode::BadRequest, payload: Some(m), seq: 0 });
             }
         };
-        let msg = match payload.get_string("message") {
+        let msg = match req.payload.get_string("message") {
             Some(m) => m.to_string(),
             None => {
                 let mut m = tlv::Map::new();
@@ -72,11 +81,57 @@ fn run_server() {
             }
         };
 
-        let _ = tx_c.send((nick, msg));
+        hub_pub.publish("chat", tlv::Map::new()
+            .set("nick", tlv::Value::String(nick))
+            .set("message", tlv::Value::String(msg))
+            .clone());
 
         let mut m = tlv::Map::new();
         m.set("sent", tlv::Value::Bool(true));
         Ok(Response { status: StatusCode::Success, payload: Some(m), seq: 0 })
+    });
+
+    // 0x0002 — Subscribe to chat (streaming)
+    let hub_sub = hub.clone();
+    srv.handle_stream(0x0002, move |req: Request, mut stream: FrameStream, key: Vec<u8>| {
+        let hub = hub_sub.clone();
+        async move {
+            let topic = req.payload.get_string("topic").unwrap_or("chat").to_string();
+            let mut rx = hub.subscribe(&topic);
+
+            // Send ACK
+            let ack = Response {
+                status: StatusCode::Success,
+                payload: Some(tlv::Map::new()
+                    .set("event", tlv::Value::String("subscribed".into()))
+                    .set("topic", tlv::Value::String(topic.clone()))
+                    .clone()),
+                seq: 0,
+            };
+            if stream.write_response(&key, 0, &ack).await.is_err() {
+                return;
+            }
+
+            let mut seq: u32 = 1;
+            loop {
+                match rx.recv().await {
+                    Ok(evt) => {
+                        let resp = Response {
+                            status: StatusCode::Success,
+                            payload: Some(tlv::Map::new()
+                                .set("event", tlv::Value::String("message".into()))
+                                .set("topic", tlv::Value::String(evt.topic))
+                                .set("payload", tlv::Value::Map(evt.payload))
+                                .clone()),
+                            seq,
+                        };
+                        seq += 1;
+                        let _ = stream.write_response(&key, resp.seq, &resp).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
     });
 
     let tls = Server::load_tls("test-cert.pem", "test-key.pem").expect("load TLS");
