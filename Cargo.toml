@@ -1,0 +1,37 @@
+[package]
+name = "hush"
+version = "0.1.0"
+edition = "2021"
+description = "Stealth-first API protocol for Rust — 1:1 mirror of hush-go"
+repository = "https://github.com/feralbureau/hush-rs"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# QUIC transport
+quinn = "0.11"
+rustls = "0.23"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+rustls-pki-types = "1"
+
+# Crypto
+x25519-dalek = "2"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+
+# Random
+rand = "0.8"
+
+# Utilities
+bytes = "1"
+thiserror = "2"
+chrono = "0.4"
+log = "0.4"
+hex = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11"
