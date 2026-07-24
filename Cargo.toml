@@ -2,7 +2,7 @@
 name = "hush"
 version = "0.1.0"
 edition = "2021"
-description = "Stealth-first API protocol for Rust — 1:1 mirror of hush-go"
+description = "hush-rs — Rust implementation of the Hush stealth API protocol"
 repository = "https://github.com/feralbureau/hush-rs"
 license = "MIT"
 
