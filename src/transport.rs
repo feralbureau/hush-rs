@@ -108,3 +108,67 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
         ]
     }
 }
+
+
+use tokio::net::TcpListener;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+/// Bind a TLS-over-TCP listener.
+///
+/// Returns a (TcpListener, TlsAcceptor) pair. Accept connections in a loop,
+/// use `accept_tcp()` to get a TLS stream.
+pub async fn tcp_bind(addr: &str, tls_config: rustls::ServerConfig) -> Result<(TcpListener, TlsAcceptor), TransportError> {
+    let tls_config = {
+        let mut cfg = tls_config;
+        cfg.alpn_protocols = vec![DEFAULT_ALPN.as_bytes().to_vec()];
+        cfg
+    };
+    let listener = TcpListener::bind(addr).await
+        .map_err(|e| TransportError::Config(format!("tcp bind {addr}: {e}")))?;
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    Ok((listener, acceptor))
+}
+
+/// Accept a TLS-over-TCP connection from a TCP listener.
+///
+/// Returns a TLS stream that implements AsyncRead + AsyncWrite + Unpin,
+/// suitable for Hush session negotiation and frame I/O.
+pub async fn tcp_accept(listener: &TcpListener, acceptor: &TlsAcceptor) -> Result<tokio_rustls::TlsStream<tokio::net::TcpStream>, TransportError> {
+    let (stream, peer_addr) = listener.accept().await
+        .map_err(|e| TransportError::Config(format!("tcp accept: {e}")))?;
+    
+    // Set TCP keepalive and nodelay
+    let _ = stream.set_nodelay(true);
+    
+    let tls_stream = acceptor.accept(stream).await
+        .map_err(|e| TransportError::Config(format!("tls accept from {peer_addr}: {e}")))?;
+    
+    Ok(tokio_rustls::TlsStream::Server(tls_stream))
+}
+
+/// Dial a TLS-over-TCP connection to the given address.
+///
+/// Returns a TLS stream that implements AsyncRead + AsyncWrite + Unpin.
+pub async fn tcp_dial(addr: &str, tls_config: rustls::ClientConfig) -> Result<tokio_rustls::TlsStream<tokio::net::TcpStream>, TransportError> {
+    let tls_config = {
+        let mut cfg = tls_config;
+        cfg.alpn_protocols = vec![DEFAULT_ALPN.as_bytes().to_vec()];
+        cfg
+    };
+    
+    let stream = tokio::net::TcpStream::connect(addr).await
+        .map_err(|e| TransportError::Config(format!("tcp connect {addr}: {e}")))?;
+    let _ = stream.set_nodelay(true);
+    
+    let connector = TlsConnector::from(Arc::new(tls_config));
+    
+    // Use the address as the server name (strip port)
+    let server_name = addr.split(':').next().unwrap_or(addr).to_string();
+    let domain = rustls::pki_types::ServerName::try_from(server_name.clone())
+        .map_err(|e| TransportError::Config(format!("invalid server name '{server_name}': {e}")))?;
+    
+    let tls_stream = connector.connect(domain, stream).await
+        .map_err(|e| TransportError::Config(format!("tls handshake to {addr}: {e}")))?;
+    
+    Ok(tokio_rustls::TlsStream::Client(tls_stream))
+}

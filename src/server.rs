@@ -297,6 +297,58 @@ impl Server {
         }
     }
 
+    /// Listen for TCP connections (TLS-over-TCP) and serve Hush requests.
+    ///
+    /// Use this behind Cloudflare or any TCP-only load balancer.
+    /// Each TCP connection handles one session with sequential request-response.
+    /// Streaming handlers are not supported over TCP.
+    pub async fn listen_tcp(&self, addr: &str) -> Result<(), ServerError> {
+        let tls = self.tls_config
+            .as_ref()
+            .ok_or_else(|| ServerError::Config("TLS config required; use with_tls()".into()))?
+            .as_ref()
+            .clone();
+
+        let (listener, acceptor) = transport::tcp_bind(addr, tls).await?;
+        let local_addr = listener.local_addr()
+            .map_err(|e| ServerError::Config(format!("local addr: {e}")))?;
+
+        self.log("INF", format_args!("listening TCP on {local_addr} (ALPN: {})", transport::DEFAULT_ALPN));
+
+        // Start session GC
+        let sessions = self.sessions.clone();
+        let gc_interval = self.session_cfg.gc_interval;
+        tokio::spawn(async move {
+            gc_loop(sessions, gc_interval).await;
+        });
+
+        // Accept loop
+        loop {
+            let tls_stream = match transport::tcp_accept(&listener, &acceptor).await {
+                Ok(s) => s,
+                Err(e) => {
+                    self.log("WRN", format_args!("tcp accept: {e}"));
+                    continue;
+                }
+            };
+
+            let handlers = self.handlers.clone();
+            let key_store = self.key_store.clone();
+            let sessions = self.sessions.clone();
+            let server_priv = self.server_priv.clone();
+            let server_pub = self.server_pub;
+            let logger = self.logger.clone();
+            let sid = self.next_id.fetch_add(1, Ordering::SeqCst);
+
+            tokio::spawn(async move {
+                let _ = handle_tcp_connection(
+                    tls_stream, sid, handlers, key_store, sessions,
+                    server_priv, server_pub, logger,
+                ).await;
+            });
+        }
+    }
+
     // ── Accessors ──────────────────────────────────────────
 
     pub fn session_store(&self) -> Arc<SessionStore> {
@@ -366,37 +418,61 @@ async fn handle_connection(
         let mut header = [0u8; 2];
         recv.read_exact(&mut header).await?;
         let key_len = u16::from_be_bytes(header) as usize;
-        if key_len == 0 || key_len > 256 {
+        if key_len > 256 {
             return Err(ServerError::Config("invalid key length".into()));
         }
 
-        let mut key_buf = vec![0u8; key_len + 32];
-        recv.read_exact(&mut key_buf).await?;
+        let (aid, session_key) = if key_len == 0 {
+            // Anonymous session — read just the pubkey, use dummy secret
+            let mut client_pub_bytes = [0u8; 32];
+            recv.read_exact(&mut client_pub_bytes).await?;
+            let client_pub = PublicKey::from(client_pub_bytes);
 
-        let aid = String::from_utf8_lossy(&key_buf[..key_len]).to_string();
-        let client_pub_bytes: [u8; 32] = key_buf[key_len..]
-            .try_into()
-            .map_err(|_| ServerError::Config("invalid client pubkey".into()))?;
-        let client_pub = PublicKey::from(client_pub_bytes);
+            let shared = session::shared_secret_static(&server_priv, &client_pub);
+            let session_key = session::derive_session_key(shared.as_bytes(), b"hush-anonymous")?;
 
-        let api_key_secret = key_store.get(&aid)
-            .ok_or_else(|| ServerError::Config(format!("unknown api key '{aid}'")))?;
+            let spub_bytes = server_pub.to_bytes();
+            let mut resp = Vec::with_capacity(40);
+            resp.extend_from_slice(&spub_bytes);
+            resp.extend_from_slice(&session_id.to_be_bytes());
+            send.write_all(&resp).await?;
 
-        let shared = session::shared_secret_static(&server_priv, &client_pub);
-        let session_key = session::derive_session_key(shared.as_bytes(), &api_key_secret)?;
+            log_info(&logger, format_args!(
+                "session[{session_id}] anonymous established remote={}", conn.remote_address()
+            ));
 
-        let spub_bytes = server_pub.to_bytes();
-        let mut resp = Vec::with_capacity(40);
-        resp.extend_from_slice(&spub_bytes);
-        resp.extend_from_slice(&session_id.to_be_bytes());
-        send.write_all(&resp).await?;
+            (String::new(), session_key)
+        } else {
+            let mut key_buf = vec![0u8; key_len + 32];
+            recv.read_exact(&mut key_buf).await?;
+
+            let aid = String::from_utf8_lossy(&key_buf[..key_len]).to_string();
+            let client_pub_bytes: [u8; 32] = key_buf[key_len..]
+                .try_into()
+                .map_err(|_| ServerError::Config("invalid client pubkey".into()))?;
+            let client_pub = PublicKey::from(client_pub_bytes);
+
+            let api_key_secret = key_store.get(&aid)
+                .ok_or_else(|| ServerError::Config(format!("unknown api key '{aid}'")))?;
+
+            let shared = session::shared_secret_static(&server_priv, &client_pub);
+            let session_key = session::derive_session_key(shared.as_bytes(), &api_key_secret)?;
+
+            let spub_bytes = server_pub.to_bytes();
+            let mut resp = Vec::with_capacity(40);
+            resp.extend_from_slice(&spub_bytes);
+            resp.extend_from_slice(&session_id.to_be_bytes());
+            send.write_all(&resp).await?;
+
+            log_info(&logger, format_args!(
+                "session[{session_id}] established key={aid} remote={}", conn.remote_address()
+            ));
+
+            (aid, session_key)
+        };
 
         let sess = Session::new(session_id, aid.clone(), session_key);
         sessions.insert(sess);
-
-        log_info(&logger, format_args!(
-            "session[{session_id}] established key={aid} remote={}", conn.remote_address()
-        ));
 
         aid
     };
@@ -532,6 +608,175 @@ async fn handle_request_stream(
             }
         }
     }
+}
+
+// ── TCP connection handler ───────────────────────────────
+
+async fn handle_tcp_connection(
+    mut stream: tokio_rustls::TlsStream<tokio::net::TcpStream>,
+    session_id: u64,
+    handlers: Arc<Mutex<HashMap<u16, HandlerType>>>,
+    key_store: Arc<dyn ApiKeyStore>,
+    sessions: Arc<SessionStore>,
+    server_priv: StaticSecret,
+    server_pub: PublicKey,
+    logger: Option<Arc<Logger>>,
+) -> Result<(), ServerError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // ── Handshake ──────────────────────────────────────────
+    let (api_key_id, session_key) = {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).await?;
+        let key_len = u16::from_be_bytes(header) as usize;
+        if key_len > 256 {
+            return Err(ServerError::Config("invalid key length".into()));
+        }
+
+        if key_len == 0 {
+            // Anonymous
+            let mut client_pub_bytes = [0u8; 32];
+            stream.read_exact(&mut client_pub_bytes).await?;
+            let client_pub = PublicKey::from(client_pub_bytes);
+
+            let shared = session::shared_secret_static(&server_priv, &client_pub);
+            let session_key = session::derive_session_key(shared.as_bytes(), b"hush-anonymous")?;
+
+            let spub_bytes = server_pub.to_bytes();
+            let mut resp = Vec::with_capacity(40);
+            resp.extend_from_slice(&spub_bytes);
+            resp.extend_from_slice(&session_id.to_be_bytes());
+            stream.write_all(&resp).await?;
+
+            log_info(&logger, format_args!(
+                "session[{session_id}] tcp anonymous established"
+            ));
+
+            (String::new(), session_key)
+        } else {
+            let mut key_buf = vec![0u8; key_len + 32];
+            stream.read_exact(&mut key_buf).await?;
+
+            let aid = String::from_utf8_lossy(&key_buf[..key_len]).to_string();
+            let client_pub_bytes: [u8; 32] = key_buf[key_len..]
+                .try_into()
+                .map_err(|_| ServerError::Config("invalid client pubkey".into()))?;
+            let client_pub = PublicKey::from(client_pub_bytes);
+
+            let api_key_secret = key_store.get(&aid)
+                .ok_or_else(|| ServerError::Config(format!("unknown api key '{aid}'")))?;
+
+            let shared = session::shared_secret_static(&server_priv, &client_pub);
+            let session_key = session::derive_session_key(shared.as_bytes(), &api_key_secret)?;
+
+            let spub_bytes = server_pub.to_bytes();
+            let mut resp = Vec::with_capacity(40);
+            resp.extend_from_slice(&spub_bytes);
+            resp.extend_from_slice(&session_id.to_be_bytes());
+            stream.write_all(&resp).await?;
+
+            log_info(&logger, format_args!(
+                "session[{session_id}] tcp established key={aid}"
+            ));
+
+            (aid, session_key)
+        }
+    };
+
+    let sess = Session::new(session_id, api_key_id.clone(), session_key.clone());
+    sessions.insert(sess);
+
+    // ── Request loop ─────────────────────────────────────
+    loop {
+        // Check session expiry
+        if let Some(ref sess) = sessions.get(session_id) {
+            if sessions.is_expired(&sess) || sessions.is_idle_dead(&sess) {
+                let resp = Response { status: StatusCode::SessionExpired, payload: None, seq: 0 };
+                if let Ok(body) = frame::encode_response_body(Some(&session_key), &resp) {
+                    let _ = frame::write_frame_async(&mut stream, 0, &body).await;
+                }
+                break;
+            }
+        }
+        if let Some(mut sess) = sessions.get(session_id) {
+            sess.touch();
+        }
+
+        // Read request frame
+        let (freq, seq) = match frame::read_request_async(&mut stream, Some(&session_key)).await {
+            Ok(r) => r,
+            Err(e) => {
+            log_info(&logger, format_args!("session[{session_id}] tcp read request: {e}"));
+                break;
+            }
+        };
+
+        // Look up handler
+        let handler = {
+            let guard = handlers.lock().unwrap();
+            guard.get(&freq.opcode).cloned()
+        };
+
+        let handler = match handler {
+            Some(h) => h,
+            None => {
+                let mut m = tlv::Map::new();
+                m.set("opcode", tlv::Value::Uint16(freq.opcode));
+                let resp = Response { status: StatusCode::NotFound, payload: Some(m), seq };
+                if let Ok(body) = frame::encode_response_body(Some(&session_key), &resp) {
+                    let _ = frame::write_frame_async(&mut stream, seq, &body).await;
+                }
+                continue;
+            }
+        };
+
+        let req = Request {
+            opcode: freq.opcode,
+            payload: freq.payload.unwrap_or_else(tlv::Map::new),
+            session_id,
+            api_key_id: api_key_id.clone(),
+        };
+
+        // Reject streaming handlers over TCP
+        match handler {
+            HandlerType::Stream(_) => {
+                let mut m = tlv::Map::new();
+                m.set("error", tlv::Value::String("streaming not supported over TCP".into()));
+                let resp = Response { status: StatusCode::BadRequest, payload: Some(m), seq };
+                if let Ok(body) = frame::encode_response_body(Some(&session_key), &resp) {
+                    let _ = frame::write_frame_async(&mut stream, seq, &body).await;
+                }
+            }
+            HandlerType::Sync(handler) => {
+                let start = Instant::now();
+                match handler(req) {
+                    Ok(resp) => {
+                        let elapsed = start.elapsed();
+                        log_info(&logger, format_args!(
+                            "session[{}] tcp opcode=0x{:04x} status={} elapsed={}s",
+                            session_id, freq.opcode, resp.status.name(), elapsed.as_secs_f64(),
+                        ));
+                        if let Ok(body) = frame::encode_response_body(Some(&session_key), &resp) {
+                            let _ = frame::write_frame_async(&mut stream, seq, &body).await;
+                        }
+                    }
+                    Err(e) => {
+                        log_err(&logger, format_args!(
+                            "session[{session_id}] tcp opcode=0x{:04x} error: {e}", freq.opcode
+                        ));
+                        let resp = error_response(StatusCode::InternalError, "internal error");
+                        if let Ok(body) = frame::encode_response_body(Some(&session_key), &resp) {
+                            let _ = frame::write_frame_async(&mut stream, seq, &body).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    sessions.delete(session_id);
+    log_info(&logger, format_args!("session[{session_id}] tcp closed"));
+    Ok(())
 }
 
 // ── GC loop ────────────────────────────────────────────────
