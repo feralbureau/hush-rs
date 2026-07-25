@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,10 +38,14 @@ impl From<quinn::ReadExactError> for ClientError {
     }
 }
 
+type TcpStream = tokio_rustls::TlsStream<tokio::net::TcpStream>;
+type TcpMutex = Arc<tokio::sync::Mutex<TcpStream>>;
+
 /// Internal transport type
 enum Transport {
     Quinn(quinn::Connection),
-    Tcp(tokio::sync::Mutex<tokio_rustls::TlsStream<tokio::net::TcpStream>>),
+    /// Stored as Arc<Mutex> so we can get OwnedMutexGuard for streaming.
+    Tcp(TcpMutex),
 }
 
 pub struct Client {
@@ -50,10 +55,31 @@ pub struct Client {
     session_key: Vec<u8>,
 }
 
+/// A reader returned by [`Client::start_stream`].
+///
+/// Implements [`tokio::io::AsyncRead`]. For TCP the inner mutex guard is held
+/// for the lifetime of this value — no other requests can use the connection
+/// until this is dropped.
+pub enum StreamReader {
+    Quinn(quinn::RecvStream),
+    Tcp(tokio::sync::OwnedMutexGuard<TcpStream>),
+}
+
+impl tokio::io::AsyncRead for StreamReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StreamReader::Quinn(r) => std::pin::Pin::new(r).poll_read(cx, buf),
+            StreamReader::Tcp(g) => std::pin::Pin::new(&mut **g).poll_read(cx, buf),
+        }
+    }
+}
+
 impl Client {
     /// Dial a QUIC Hush connection.
-    ///
-    /// If `api_key` has an empty ID, performs an anonymous handshake.
     pub async fn dial(
         addr: &str,
         api_key: &ApiKey,
@@ -68,7 +94,6 @@ impl Client {
         let pub_bytes = public.to_bytes();
 
         let (session_key, session_id, api_key_id) = if api_key.id.is_empty() {
-            // Anonymous: send key_len=0 + pubkey only
             let mut buf = Vec::with_capacity(2 + 32);
             buf.extend_from_slice(&(0u16).to_be_bytes());
             buf.extend_from_slice(&pub_bytes);
@@ -122,8 +147,6 @@ impl Client {
     }
 
     /// Dial a TCP Hush connection (TLS-over-TCP, useful behind Cloudflare).
-    ///
-    /// If `api_key` has an empty ID, performs an anonymous handshake.
     pub async fn dial_tcp(
         addr: &str,
         api_key: &ApiKey,
@@ -136,7 +159,6 @@ impl Client {
         let pub_bytes = public.to_bytes();
 
         let (session_key, session_id, api_key_id) = if api_key.id.is_empty() {
-            // Anonymous
             let mut buf = Vec::with_capacity(2 + 32);
             buf.extend_from_slice(&(0u16).to_be_bytes());
             buf.extend_from_slice(&pub_bytes);
@@ -181,16 +203,14 @@ impl Client {
         let sess = Session::new(session_id, api_key_id, session_key.clone());
 
         Ok(Client {
-            transport: Transport::Tcp(tokio::sync::Mutex::new(stream)),
+            transport: Transport::Tcp(Arc::new(tokio::sync::Mutex::new(stream))),
             _session: sess,
             seq: AtomicU32::new(0),
             session_key,
         })
     }
 
-    /// Send a request and receive a response.
-    ///
-    /// Works for both QUIC and TCP transports.
+    /// Send a request and receive a response. Works for both QUIC and TCP.
     pub async fn do_(&self, opcode: u16, payload: Option<tlv::Map>) -> Result<Response, ClientError> {
         match &self.transport {
             Transport::Quinn(conn) => self.do_quinn(conn, opcode, payload).await,
@@ -213,7 +233,6 @@ impl Client {
 
         send.write_all(&frame_bytes).await?;
 
-        // Read response: [4-byte len][4-byte seq][data]
         let mut len_buf = [0u8; 4];
         recv.read_exact(&mut len_buf).await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e))?;
@@ -233,7 +252,7 @@ impl Client {
 
     async fn do_tcp(
         &self,
-        mtx: &tokio::sync::Mutex<tokio_rustls::TlsStream<tokio::net::TcpStream>>,
+        mtx: &TcpMutex,
         opcode: u16,
         payload: Option<tlv::Map>,
     ) -> Result<Response, ClientError> {
@@ -247,7 +266,6 @@ impl Client {
 
         stream.write_all(&frame_bytes).await?;
 
-        // Read response: [4-byte len][4-byte seq][data]
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e))?;
@@ -267,5 +285,58 @@ impl Client {
 
     pub fn session_id(&self) -> u64 {
         self._session.id
+    }
+
+    /// Get the underlying QUIC connection (QUIC mode only).
+    pub fn get_quinn_connection(&self) -> Option<&quinn::Connection> {
+        match &self.transport {
+            Transport::Quinn(conn) => Some(conn),
+            Transport::Tcp(_) => None,
+        }
+    }
+
+    /// Get the session AES key for manual frame I/O.
+    pub fn get_session_key(&self) -> &[u8] {
+        &self.session_key
+    }
+
+    /// Open a bidirectional QUIC stream (QUIC mode only).
+    pub async fn open_bi_stream(&self) -> Result<(quinn::SendStream, quinn::RecvStream), ClientError> {
+        match &self.transport {
+            Transport::Quinn(conn) => conn.open_bi().await.map_err(ClientError::from),
+            Transport::Tcp(_) => Err(ClientError::Negotiate(
+                "use start_stream() for TCP streaming".into(),
+            )),
+        }
+    }
+
+    /// Start a streaming request. Returns a [`StreamReader`] that implements `AsyncRead`.
+    ///
+    /// QUIC: opens a new stream, writes the request header, returns recv side.
+    /// TCP: acquires an exclusive lock on the connection, writes the request,
+    /// and returns a reader that holds that lock until dropped.
+    pub async fn start_stream(
+        &self,
+        opcode: u16,
+        payload: Option<tlv::Map>,
+    ) -> Result<StreamReader, ClientError> {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        let req = Request { opcode, payload };
+        let req_body = frame::encode_request_body(Some(&self.session_key), &req)?;
+        let frame_bytes = frame::encode_frame(seq, &req_body)?;
+
+        match &self.transport {
+            Transport::Quinn(conn) => {
+                let (mut send, recv) = conn.open_bi().await?;
+                send.write_all(&frame_bytes).await?;
+                let _ = send.finish();
+                Ok(StreamReader::Quinn(recv))
+            }
+            Transport::Tcp(mtx) => {
+                let mut guard = mtx.clone().lock_owned().await;
+                guard.write_all(&frame_bytes).await?;
+                Ok(StreamReader::Tcp(guard))
+            }
+        }
     }
 }
