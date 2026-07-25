@@ -58,7 +58,10 @@ pub async fn dial(
 }
 
 pub fn insecure_client_tls() -> rustls::ClientConfig {
-    rustls::ClientConfig::builder()
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(
             Arc::new(SkipVerify),

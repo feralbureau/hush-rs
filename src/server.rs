@@ -206,7 +206,10 @@ impl Server {
             .map_err(|e| ServerError::Config(format!("parse key: {e}")))?
             .ok_or_else(|| ServerError::Config("no private key".into()))?;
 
-        rustls::ServerConfig::builder()
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        rustls::ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| ServerError::Config(format!("tls: {e}")))
