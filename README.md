@@ -1,6 +1,6 @@
 # hush-rs 🔇
 
-**Stealth-first API protocol for Rust — QUIC and TCP.**
+**Stealth-first API protocol for Rust.**
 
 Hush is a network protocol framework that makes your API invisible to standard
 tooling. No HTTP endpoints to discover, no readable request structure, no replay
@@ -8,12 +8,13 @@ tooling. No HTTP endpoints to discover, no readable request structure, no replay
 attacks. Supports both **QUIC** (UDP, fast) and **TLS-over-TCP** (compatible with
 Cloudflare and standard load balancers), encodes payloads in a compact binary
 TLV format, and encrypts every frame with per-session AES-256-GCM keys.
+```
 [dependencies]
 hush = { git = "https://github.com/feralbureau/hush-rs" }
 ```
 
 This is the Rust implementation of Hush. It mirrors [hush-go](https://github.com/feralbureau/hush-go)
-exactly — same wire format, same crypto, same semantics. A hush-go server and a
+exactly, same wire format, same crypto and same semantics. A hush-go server and a
 hush-rs client interoperate seamlessly.
 
 ---
